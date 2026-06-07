@@ -2,21 +2,26 @@ import requests
 import time
 import json
 import os
- 
+import logging
+
+# Initialize Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
 # ============================
 # CONFIGURATION
 # ============================
- 
+
 GOOGLE_WEBHOOK_URL = os.getenv(
     "GOOGLE_WEBHOOK_URL",
     "https://script.google.com/macros/s/YOUR_ID/exec"
 )
- 
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
- 
+
 OREF_URL = "https://www.oref.org.il/WarningMessages/alert/alerts.json"
- 
+
+# OREF blocks non-browser clients, so we spoof a real browser request.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -27,136 +32,145 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
     "Accept": "application/json"
 }
- 
-# Hebrew town names in Unicode-safe form
+
+# Hebrew town names in Unicode-safe form (escapes survive any encoding mangling)
 TOWNS_TO_WATCH = [
-    "\u05E6\u05D5\u05E8 \u05DE\u05E9\u05D4",   # צור משה
-    "\u05EA\u05DC \u05D0\u05D1\u05D9\u05D1",   # תל אביב
-    "\u05D1\u05D0\u05E8 \u05E9\u05D1\u05E2",   # באר שבע
-    "\u05DE\u05D8\u05D5\u05DC\u05D4",         # מטולה
-    "\u05D0\u05D9\u05DC\u05EA"                # אילת
+    "צור משה",   # צור משה
+    "תל אביב",   # תל אביב
+    "באר שבע",   # באר שבע
+    "מטולה",          # מטולה
+    "אילת"                 # אילת
 ]
- 
+
 # ============================
 # NOTIFICATION FUNCTIONS
 # ============================
- 
-def send_to_google(city, category):
+
+def send_to_google(city, category, session=None):
+    """POST a matched alert to the Google Apps Script webhook."""
     try:
+        # Reuse the pooled session when provided, else fall back to requests.
+        http_client = session if session else requests
         payload = {"city": city, "category": category}
-        requests.post(GOOGLE_WEBHOOK_URL, json=payload, timeout=7)
-        print(f"[GOOGLE] Sent → {city} ({category})")
+        response = http_client.post(GOOGLE_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()
+        logging.info(f"[GOOGLE] Sent → {city} ({category})")
     except Exception as e:
-        print(f"[GOOGLE ERROR] {e}")
- 
- 
-def send_telegram(city, category):
+        logging.error(f"[GOOGLE ERROR] {e}")
+
+
+def send_telegram(city, category, session=None):
+    """Send a Telegram message for a matched alert (no-op if not configured)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TELEGRAM] Missing Telegram config.")
+        logging.warning("[TELEGRAM] Missing Telegram config.")
         return
- 
+
     try:
-        message = f"🚨 *Red Alert*\nCity: {city}\nCategory: {category}"
- 
+        http_client = session if session else requests
+        message = f"🚨 *Red Alert*\n*City:* {city}\n*Category:* {category}"
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "Markdown"
         }
- 
-        requests.post(url, json=payload, timeout=7)
-        print(f"[TELEGRAM] Sent → {city}")
- 
+        response = http_client.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        logging.info(f"[TELEGRAM] Sent → {city}")
     except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
- 
- 
+        logging.error(f"[TELEGRAM ERROR] {e}")
+
+
 # ============================
 # CITY MATCHING (SUBSTRING)
 # ============================
- 
+
 def normalize_city(city: str) -> str:
     """Normalize Hebrew town names for safer substring comparison."""
-    return city.replace("־", "-").replace("–", "-").replace("—", "-").strip()
- 
- 
+    # Collapse Hebrew punctuation variants and strip quotes/whitespace.
+    return (
+        city.replace("־", "-")
+            .replace("–", "-")
+            .replace("—", "-")
+            .replace('"', '')
+            .replace("'", "")
+            .strip()
+    )
+
+
+# Normalize the watch list once so both sides of the comparison match.
+_WATCHED_NORM = [normalize_city(t) for t in TOWNS_TO_WATCH]
+
+
 def is_relevant_city(city: str) -> bool:
     """Check if any watched town is a substring of the reported city."""
     city_norm = normalize_city(city)
-    for watched in TOWNS_TO_WATCH:
-        if watched in city_norm:
-            return True
-    return False
- 
- 
+    # Substring match: OREF often reports "תל אביב - מרכז העיר" etc.
+    return any(watched in city_norm for watched in _WATCHED_NORM)
+
+
 # ============================
 # MAIN ALERT LISTENER
 # ============================
- 
+
 def check_alerts():
-    print("[SYSTEM] Starting optimized Red Alert listener (15 sec interval)...")
- 
+    logging.info("[SYSTEM] Starting Red Alert listener (15 sec interval)...")
+
     last_alert_id = None
     session = requests.Session()
     session.headers.update(HEADERS)
- 
+
     while True:
         try:
+            # Use utf-8-sig to automatically handle the BOM if present.
             response = session.get(OREF_URL, timeout=7)
-            raw = response.content  # consume entire body
- 
-            # NO ALERT (usual)
-            if raw in (b'\xef\xbb\xbf\n', b'\xef\xbb\xbf\r\n'):
-                time.sleep(15)
-                continue
- 
-            # Strip BOM
-            if raw.startswith(b'\xef\xbb\xbf'):
-                raw = raw[3:]
- 
-            text = raw.decode("utf-8", errors="replace").strip()
- 
-            # HTML → blocked/IP challenge
-            if text.startswith("<"):
-                print("[WARN] HTML from OREF (blocked?). Sleeping 60 sec.")
+            response.encoding = 'utf-8-sig'
+            text = response.text.strip()
+
+            # NO ALERT (usual empty responses from OREF)
+            if not text or text in ('\n', '\r\n'):
+                pass
+            elif text.startswith("<"):
+                logging.warning("[WARN] HTML received (possibly blocked). Sleeping 60s.")
                 time.sleep(60)
                 continue
- 
-            # Cloudflare noise
-            if text.startswith(")]}'"):
+            # Strip Cloudflare/anti-JSON-hijacking prefix noise
+            elif text.startswith(")]}'"):
                 text = text[4:].strip()
- 
-            try:
-                data = json.loads(text)
-            except Exception:
-                print("[WARN] Malformed JSON from OREF, skipping.")
-                time.sleep(15)
-                continue
- 
-            alert_id = data.get("id")
-            cities = data.get("data", [])
-            category = data.get("title", "צבע אדום")
- 
-            if alert_id != last_alert_id:
-                last_alert_id = alert_id
-                print(f"[ALERT] New alert → {cities}")
- 
-                for city in cities:
-                    if is_relevant_city(city):
-                        print(f"[MATCH] Relevant alert: {city}")
-                        send_to_google(city, category)
-                        send_telegram(city, category)
- 
+
+            if text and not text.startswith("<"):
+                try:
+                    data = json.loads(text)
+                    alert_id = data.get("id")
+                    cities = data.get("data", [])
+                    category = data.get("title", "צבע אדום")
+
+                    # Only act on a new alert id to avoid duplicate notifications.
+                    if alert_id and alert_id != last_alert_id:
+                        last_alert_id = alert_id
+                        logging.info(f"[ALERT] New alert ({alert_id}) → {cities}")
+
+                        for city in cities:
+                            if is_relevant_city(city):
+                                logging.info(f"[MATCH] Relevant alert: {city}")
+                                send_to_google(city, category, session=session)
+                                send_telegram(city, category, session=session)
+                except json.JSONDecodeError:
+                    logging.warning("[WARN] Could not parse JSON response.")
+
+        except KeyboardInterrupt:
+            # Allow Ctrl+C to stop the listener cleanly.
+            logging.info("[SYSTEM] Stopping Red Alert listener.")
+            break
         except Exception as e:
-            print(f"[ERROR] Unexpected error: {e}")
- 
+            logging.error(f"[ERROR] Unexpected error: {e}")
+
         time.sleep(15)
- 
- 
+
+
 # ============================
 # ENTRY POINT
 # ============================
- 
+
 if __name__ == "__main__":
     check_alerts()
