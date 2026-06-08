@@ -36,38 +36,60 @@ HEADERS = {
 # Hebrew town names in Unicode-safe form (escapes survive any encoding mangling)
 TOWNS_TO_WATCH = [
     "צור משה",   # צור משה
-    "תל אביב",   # תל אביב
-    "באר שבע",   # באר שבע
-    "מטולה",          # מטולה
-    "אילת"                 # אילת
+    "כפר סבא",   # כפר סבא
+    "הוד השרון",   # Hod Hasharon
 ]
 
 # ============================
-# NOTIFICATION FUNCTIONS
+# HELPER FUNCTIONS
 # ============================
 
+def is_relevant_city(city_name):
+    """Checks if the city name matches any of our target towns."""
+    if not city_name:
+        return False
+    city_clean = city_name.strip()
+    return any(town in city_clean for town in TOWNS_TO_WATCH)
+
+
 def send_to_google(city, category, session=None):
-    """POST a matched alert to the Google Apps Script webhook."""
+    """Sends the alert data to a Google Apps Script Webhook."""
+    if not GOOGLE_WEBHOOK_URL or "YOUR_ID" in GOOGLE_WEBHOOK_URL:
+        logging.warning("[GOOGLE] Missing or default webhook URL.")
+        return
+
     try:
-        # Reuse the pooled session when provided, else fall back to requests.
         http_client = session if session else requests
         payload = {"city": city, "category": category}
         response = http_client.post(GOOGLE_WEBHOOK_URL, json=payload, timeout=10)
         response.raise_for_status()
-        logging.info(f"[GOOGLE] Sent → {city} ({category})")
+        logging.info(f"[GOOGLE] Sent → {city}")
     except Exception as e:
         logging.error(f"[GOOGLE ERROR] {e}")
 
 
-def send_telegram(city, category, session=None):
-    """Send a Telegram message for a matched alert (no-op if not configured)."""
+def send_telegram(city, category, description, is_shelter_instruction, session=None):
+    """Sends a formatted notification to a Telegram Chat."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("[TELEGRAM] Missing Telegram config.")
         return
 
     try:
         http_client = session if session else requests
-        message = f"🚨 *Red Alert*\n*City:* {city}\n*Category:* {category}"
+        
+        # קביעת הכותרת והדגש בהתאם לצורך בכניסה לממ"ד/מקלט כדי להרוויח את זמן ההתרעה המוקדם
+        if is_shelter_instruction:
+            header = "🚨🏃‍♂️ *[כניסה מיידית לממ''ד / מקלט]*"
+        else:
+            header = "⚠️ *[התרעת פיקוד העורף - הנחיה כללית]*"
+            
+        message = (
+            f"{header}\n\n"
+            f"*מיקום:* {city}\n"
+            f"*סוג הסכנה:* {category}\n"
+            f"*הנחיית התגוננות:* {description if description else 'פעל לפי הנחיות גורמי הביטחון.'}"
+        )
+        
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TELEGRAM_CHAT_ID,
@@ -82,60 +104,29 @@ def send_telegram(city, category, session=None):
 
 
 # ============================
-# CITY MATCHING (SUBSTRING)
-# ============================
-
-def normalize_city(city: str) -> str:
-    """Normalize Hebrew town names for safer substring comparison."""
-    # Collapse Hebrew punctuation variants and strip quotes/whitespace.
-    return (
-        city.replace("־", "-")
-            .replace("–", "-")
-            .replace("—", "-")
-            .replace('"', '')
-            .replace("'", "")
-            .strip()
-    )
-
-
-# Normalize the watch list once so both sides of the comparison match.
-_WATCHED_NORM = [normalize_city(t) for t in TOWNS_TO_WATCH]
-
-
-def is_relevant_city(city: str) -> bool:
-    """Check if any watched town is a substring of the reported city."""
-    city_norm = normalize_city(city)
-    # Substring match: OREF often reports "תל אביב - מרכז העיר" etc.
-    return any(watched in city_norm for watched in _WATCHED_NORM)
-
-
-# ============================
-# MAIN ALERT LISTENER
+# MAIN CORE LOGIC
 # ============================
 
 def check_alerts():
-    logging.info("[SYSTEM] Starting Red Alert listener (15 sec interval)...")
-
+    """Polls the OREF API for new alerts and triggers webhooks/notifications."""
+    logging.info("[SYSTEM] Red Alert monitoring script started.")
     last_alert_id = None
     session = requests.Session()
-    session.headers.update(HEADERS)
 
     while True:
         try:
-            # Use utf-8-sig to automatically handle the BOM if present.
-            response = session.get(OREF_URL, timeout=7)
-            response.encoding = 'utf-8-sig'
+            response = session.get(OREF_URL, headers=HEADERS, timeout=10)
+            
+            # 204 No Content means there are absolutely no active alerts in the country.
+            if response.status_code == 204:
+                time.sleep(15)
+                continue
+
+            response.raise_for_status()
             text = response.text.strip()
 
-            # NO ALERT (usual empty responses from OREF)
-            if not text or text in ('\n', '\r\n'):
-                pass
-            elif text.startswith("<"):
-                logging.warning("[WARN] HTML received (possibly blocked). Sleeping 60s.")
-                time.sleep(60)
-                continue
-            # Strip Cloudflare/anti-JSON-hijacking prefix noise
-            elif text.startswith(")]}'"):
+            # Strip malicious BOM or anti-scraping prefix if present.
+            if text.startswith(")]}'"):
                 text = text[4:].strip()
 
             if text and not text.startswith("<"):
@@ -143,18 +134,31 @@ def check_alerts():
                     data = json.loads(text)
                     alert_id = data.get("id")
                     cities = data.get("data", [])
+                    
+                    # חילוץ סוג הסכנה ושדה התיאור (הנחיה)
                     category = data.get("title", "צבע אדום")
+                    description = data.get("desc", "").strip()
+
+                    # בדיקה חכמה בשדה התיאור: האם יש הוראה אקטיבית לכניסה למחסה/מקלט/ממ"ד
+                    keywords_to_shelter = ["היכנסו", "מרחב המוגן", "מרחב מוגן", "מקלט", "מחסה", "ממ''ד", "ממّد"]
+                    is_shelter_instruction = any(word in description for word in keywords_to_shelter) or "טיס" in category or "רקטי" in category
 
                     # Only act on a new alert id to avoid duplicate notifications.
                     if alert_id and alert_id != last_alert_id:
                         last_alert_id = alert_id
-                        logging.info(f"[ALERT] New alert ({alert_id}) → {cities}")
+                        logging.info(f"[ALERT] New alert ({alert_id}) → {cities} | Category: {category} | Desc: {description}")
 
                         for city in cities:
                             if is_relevant_city(city):
-                                logging.info(f"[MATCH] Relevant alert: {city}")
-                                send_to_google(city, category, session=session)
-                                send_telegram(city, category, session=session)
+                                logging.info(f"[MATCH] Relevant alert for: {city}")
+                                
+                                # הכנת טקסט משולב עבור גוגל אנליטיקס/גיליון
+                                google_category_text = f"[{'ממ''ד' if is_shelter_instruction else 'כללי'}] {category} - {description}"
+                                send_to_google(city, google_category_text, session=session)
+                                
+                                # שליחה לטלגרם עם הפיצול הברור על בסיס שדה התיאור והקטגוריה
+                                send_telegram(city, category, description, is_shelter_instruction, session=session)
+                                
                 except json.JSONDecodeError:
                     logging.warning("[WARN] Could not parse JSON response.")
 
