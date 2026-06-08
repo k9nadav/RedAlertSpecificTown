@@ -33,11 +33,11 @@ HEADERS = {
     "Accept": "application/json"
 }
 
-# Hebrew town names in Unicode-safe form (escapes survive any encoding mangling)
+# Hebrew town names in Unicode-safe form
 TOWNS_TO_WATCH = [
     "צור משה",   # צור משה
     "כפר סבא",   # כפר סבא
-    "הוד השרון",   # Hod Hasharon
+    "הוד השרון",   # הוד השרון
 ]
 
 # ============================
@@ -77,7 +77,7 @@ def send_telegram(city, category, description, is_shelter_instruction, session=N
     try:
         http_client = session if session else requests
         
-        # קביעת הכותרת והדגש בהתאם לצורך בכניסה לממ"ד/מקלט כדי להרוויח את זמן ההתרעה המוקדם
+        # Determine the visual priority depending on whether shelter entry is required
         if is_shelter_instruction:
             header = "🚨🏃‍♂️ *[כניסה מיידית לממ''ד / מקלט]*"
         else:
@@ -129,17 +129,18 @@ def check_alerts():
             if text.startswith(")]}'"):
                 text = text[4:].strip()
 
-            if text and not text.startswith("<"):
+            # FIX: Ensure text exists, isn't HTML error page, and strictly begins as a JSON object
+            if text and not text.startswith("<") and text.startswith("{"):
                 try:
                     data = json.loads(text)
                     alert_id = data.get("id")
                     cities = data.get("data", [])
                     
-                    # חילוץ סוג הסכנה ושדה התיאור (הנחיה)
+                    # Extract the alert criteria and instruction safely
                     category = data.get("title", "צבע אדום")
                     description = data.get("desc", "").strip()
 
-                    # בדיקה חכמה בשדה התיאור: האם יש הוראה אקטיבית לכניסה למחסה/מקלט/ממ"ד
+                    # Smart keyword scanning to capture immediate early warnings
                     keywords_to_shelter = ["היכנסו", "מרחב המוגן", "מרחב מוגן", "מקלט", "מחסה", "ממ''ד", "ממّد"]
                     is_shelter_instruction = any(word in description for word in keywords_to_shelter) or "טיס" in category or "רקטי" in category
 
@@ -152,15 +153,18 @@ def check_alerts():
                             if is_relevant_city(city):
                                 logging.info(f"[MATCH] Relevant alert for: {city}")
                                 
-                                # הכנת טקסט משולב עבור גוגל אנליטיקס/גיליון
+                                # Prep combined text data for Google sheet webhook
                                 google_category_text = f"[{'ממ''ד' if is_shelter_instruction else 'כללי'}] {category} - {description}"
                                 send_to_google(city, google_category_text, session=session)
                                 
-                                # שליחה לטלגרם עם הפיצול הברור על בסיס שדה התיאור והקטגוריה
+                                # Send structured notification to Telegram
                                 send_telegram(city, category, description, is_shelter_instruction, session=session)
                                 
                 except json.JSONDecodeError:
-                    logging.warning("[WARN] Could not parse JSON response.")
+                    logging.warning("[WARN] Failed to parse a response that looked like JSON.")
+            else:
+                # If text is empty, array-based e.g., '[]', or unrelated heartbeat data, bypass quietly.
+                pass
 
         except KeyboardInterrupt:
             # Allow Ctrl+C to stop the listener cleanly.
